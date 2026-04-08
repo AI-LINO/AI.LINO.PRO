@@ -14,17 +14,15 @@ st.markdown("""
 <div style='text-align: center; background: linear-gradient(135deg, #0f0c29, #302b63, #24243e); 
      padding: 30px; border-radius: 15px; margin-bottom: 20px;'>
     <h1 style='color: #00ff88; font-size: 3em; font-family: Arial Black;'>🤖 AI.LINO PRO</h1>
-    <h3 style='color: #ffffff;'>Máquina de Dinero — HMM Viterbi + RSI + MACD</h3>
-    <p style='color: #aaaaaa;'>Señales de entrada y salida en tiempo real</p>
+    <h3 style='color: #ffffff;'>Motor de Rebote — HMM + RSI + Volumen + Niveles Exactos</h3>
+    <p style='color: #aaaaaa;'>Detecta agotamiento de vendedores · Entrada precisa · Stop Loss automático</p>
 </div>
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# FUNCIONES CORE
+# BÚSQUEDA
 # ─────────────────────────────────────────────
-
 def buscar_sugerencias(texto):
-    """Devuelve lista de sugerencias usando yf.Search"""
     try:
         resultados = yf.Search(texto, max_results=8)
         sugerencias = []
@@ -32,10 +30,10 @@ def buscar_sugerencias(texto):
             if q.get("quoteType") in ["EQUITY", "ETF", "CRYPTOCURRENCY"]:
                 ticker = q.get("symbol", "")
                 nombre = q.get("longname") or q.get("shortname", ticker)
-                tipo = q.get("quoteType", "")
+                tipo   = q.get("quoteType", "")
                 if ticker.endswith(".MX"):
                     pais = "🇲🇽"
-                elif any(ticker.endswith(x) for x in [".PA", ".DE", ".AS", ".SW", ".MC", ".MI", ".L"]):
+                elif any(ticker.endswith(x) for x in [".PA",".DE",".AS",".SW",".MC",".MI",".L"]):
                     pais = "🇪🇺"
                 elif tipo == "CRYPTOCURRENCY":
                     pais = "🪙"
@@ -52,201 +50,208 @@ def buscar_sugerencias(texto):
         return []
 
 def obtener_precio_realtime(ticker):
-    """Precio en tiempo real usando fast_info — mucho más rápido que .info"""
     try:
-        t = yf.Ticker(ticker)
-        fi = t.fast_info
+        fi     = yf.Ticker(ticker).fast_info
         precio = fi.last_price
-        precio_prev = fi.previous_close
-        if precio and precio_prev:
-            cambio_pct = ((precio - precio_prev) / precio_prev) * 100
-            return precio, cambio_pct
+        prev   = fi.previous_close
+        if precio and prev:
+            return precio, ((precio - prev) / prev) * 100
     except:
         pass
     return None, None
 
+# ─────────────────────────────────────────────
+# INDICADORES
+# ─────────────────────────────────────────────
 def calcular_rsi(precios, periodo=14):
-    delta = precios.diff()
+    delta    = precios.diff()
     ganancia = delta.where(delta > 0, 0).rolling(periodo).mean()
-    perdida = (-delta.where(delta < 0, 0)).rolling(periodo).mean()
-    rs = ganancia / perdida
+    perdida  = (-delta.where(delta < 0, 0)).rolling(periodo).mean()
+    rs       = ganancia / perdida
     return 100 - (100 / (1 + rs))
 
+def calcular_stoch_rsi(precios, periodo=14, smooth=3):
+    """Stochastic RSI — detecta agotamiento extremo más rápido que RSI normal"""
+    rsi     = calcular_rsi(precios, periodo)
+    rsi_min = rsi.rolling(periodo).min()
+    rsi_max = rsi.rolling(periodo).max()
+    stoch   = (rsi - rsi_min) / (rsi_max - rsi_min + 1e-10) * 100
+    k       = stoch.rolling(smooth).mean()
+    d       = k.rolling(smooth).mean()
+    return k, d
+
 def calcular_macd(precios):
-    ema12 = precios.ewm(span=12).mean()
-    ema26 = precios.ewm(span=26).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9).mean()
+    ema12      = precios.ewm(span=12).mean()
+    ema26      = precios.ewm(span=26).mean()
+    macd       = ema12 - ema26
+    signal     = macd.ewm(span=9).mean()
     histograma = macd - signal
     return macd, signal, histograma
 
-def calcular_score_final(estado_hmm, rsi, macd_val, signal_val, cambio):
-    score = 50
+def calcular_bollinger(precios, periodo=20):
+    media = precios.rolling(periodo).mean()
+    std   = precios.rolling(periodo).std()
+    return media + 2*std, media, media - 2*std
+
+def detectar_vela_rebote(df):
+    """
+    Detecta velas de reversión alcista:
+    Hammer, Doji, Engulfing alcista
+    """
+    senales = []
+    if len(df) < 2:
+        return senales
+    for i in range(1, len(df)):
+        o = float(df['Open'].iloc[i])
+        h = float(df['High'].iloc[i])
+        l = float(df['Low'].iloc[i])
+        c = float(df['Close'].iloc[i])
+        cuerpo      = abs(c - o)
+        rango_total = h - l + 1e-10
+        mecha_inf   = min(o, c) - l
+        mecha_sup   = h - max(o, c)
+        # Hammer
+        if mecha_inf >= 2 * cuerpo and mecha_sup <= cuerpo * 0.5 and cuerpo / rango_total < 0.4:
+            senales.append((df.index[i], "Hammer", "#00ff88"))
+        # Doji
+        elif cuerpo / rango_total < 0.1:
+            senales.append((df.index[i], "Doji", "#FFD700"))
+        # Engulfing alcista
+        elif i > 0:
+            o_prev = float(df['Open'].iloc[i-1])
+            c_prev = float(df['Close'].iloc[i-1])
+            if c_prev < o_prev and c > o and c > o_prev and o < c_prev:
+                senales.append((df.index[i], "Engulfing Alcista", "#00BFFF"))
+    return senales
+
+def detectar_divergencia_volumen(df, ventana=5):
+    """
+    Agotamiento de vendedores:
+    precio sigue bajando pero volumen decrece
+    """
+    if len(df) < ventana * 2:
+        return False, 0
+    precios_rec = df['Close'].iloc[-ventana:].values
+    vol_rec     = df['Volume'].iloc[-ventana:].values
+    precios_ant = df['Close'].iloc[-ventana*2:-ventana].values
+    vol_ant     = df['Volume'].iloc[-ventana*2:-ventana].values
+    precio_baja  = precios_rec[-1] < precios_ant[-1]
+    volumen_baja = vol_rec.mean() < vol_ant.mean()
+    if precio_baja and volumen_baja:
+        reduccion = ((vol_ant.mean() - vol_rec.mean()) / vol_ant.mean()) * 100
+        return True, round(reduccion, 1)
+    return False, 0
+
+def calcular_niveles_trading(df, precio_actual):
+    """
+    Niveles precisos de entrada, stop loss y objetivos
+    basados en soportes reales y ATR
+    """
+    close = df['Close'].squeeze()
+    high  = df['High'].squeeze()
+    low   = df['Low'].squeeze()
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    atr              = tr.rolling(14).mean().iloc[-1]
+    soporte_reciente = low.iloc[-10:].min()
+    resistencia      = high.iloc[-10:].max()
+    soporte_fuerte   = low.iloc[-30:].min()
+    _, _, bb_low_s   = calcular_bollinger(close)
+    entrada_ideal    = soporte_reciente * 1.005
+    stop_loss        = soporte_reciente - atr
+    objetivo_1       = precio_actual + atr * 1.5
+    objetivo_2       = precio_actual + atr * 3.0
+    objetivo_3       = resistencia * 0.995
+    riesgo_pct       = ((precio_actual - stop_loss) / precio_actual) * 100
+    pot_ganancia     = ((objetivo_2 - precio_actual) / precio_actual) * 100
+    rr_ratio         = pot_ganancia / riesgo_pct if riesgo_pct > 0 else 0
+    return {
+        "entrada":        round(entrada_ideal, 4),
+        "stop_loss":      round(stop_loss, 4),
+        "objetivo_1":     round(objetivo_1, 4),
+        "objetivo_2":     round(objetivo_2, 4),
+        "objetivo_3":     round(objetivo_3, 4),
+        "soporte":        round(soporte_reciente, 4),
+        "resistencia":    round(resistencia, 4),
+        "soporte_fuerte": round(soporte_fuerte, 4),
+        "atr":            round(atr, 4),
+        "riesgo_pct":     round(riesgo_pct, 2),
+        "pot_ganancia":   round(pot_ganancia, 2),
+        "rr_ratio":       round(rr_ratio, 2),
+        "bb_low":         round(bb_low_s.iloc[-1], 4),
+    }
+
+def calcular_score_rebote(estado_hmm, rsi, stoch_k, stoch_d,
+                           macd_val, signal_val, agotamiento_vol,
+                           velas_rebote, precio_vs_bb_low):
+    """Score especializado en detectar rebotes."""
+    score   = 50
+    razones = []
+    alertas = []
+    # HMM
     if estado_hmm == "ALCISTA":
-        score += 25
+        score += 15
+        razones.append("HMM detecta regimen alcista")
     elif estado_hmm == "BAJISTA":
-        score -= 25
-    if rsi < 30:
-        score += 20
+        score -= 10
+        alertas.append("HMM en regimen bajista — rebote de corta duracion esperado")
+    else:
+        razones.append("HMM en lateral — posible acumulacion")
+    # RSI
+    if rsi < 25:
+        score += 25
+        razones.append(f"RSI extremo ({rsi:.1f}) — agotamiento de vendedores fuerte")
+    elif rsi < 35:
+        score += 15
+        razones.append(f"RSI en sobreventa ({rsi:.1f}) — zona de rebote")
     elif rsi > 70:
         score -= 20
-    elif 40 < rsi < 60:
-        score += 5
-    if macd_val > signal_val:
-        score += 15
-    else:
+        alertas.append(f"RSI sobrecomprado ({rsi:.1f}) — no entrar")
+    elif rsi > 60:
+        score -= 10
+        alertas.append(f"RSI elevado ({rsi:.1f}) — cuidado")
+    # Stoch RSI
+    if stoch_k < 20 and stoch_d < 20:
+        score += 20
+        razones.append(f"Stoch RSI en zona extrema ({stoch_k:.1f}) — rebote inminente")
+    elif stoch_k > stoch_d and stoch_k < 40:
+        score += 10
+        razones.append(f"Stoch RSI cruzando al alza ({stoch_k:.1f}) — impulso iniciando")
+    elif stoch_k > 80:
         score -= 15
-    if cambio > 0:
-        score += 5
+        alertas.append(f"Stoch RSI sobrecomprado ({stoch_k:.1f}) — salir pronto")
+    # MACD
+    if macd_val > signal_val:
+        score += 10
+        razones.append("MACD sobre senal — momentum positivo")
     else:
         score -= 5
-    return max(0, min(100, score))
+        alertas.append("MACD bajo senal — presion vendedora activa")
+    # Agotamiento volumen
+    if agotamiento_vol[0]:
+        score += 20
+        razones.append(f"Volumen de venta cae {agotamiento_vol[1]}% — vendedores agotados")
+    else:
+        alertas.append("Volumen sin divergencia confirmada aun")
+    # Velas
+    if len(velas_rebote) > 0:
+        score += 15
+        razones.append(f"Patron de vela: {velas_rebote[-1][1]} detectado")
+    # Bollinger
+    if precio_vs_bb_low < 0:
+        score += 15
+        razones.append("Precio bajo Banda Bollinger inferior — zona de reversion estadistica")
+    elif precio_vs_bb_low < 2:
+        score += 5
+        razones.append("Precio rozando Banda Bollinger inferior")
+    return max(0, min(100, score)), razones, alertas
 
-def grafica_trading_profesional(df_intraday, ticker, nombre):
-    """
-    Gráfica de velas japonesas intradía con:
-    - Velas japonesas (OHLC)
-    - Volumen con colores
-    - EMA 9 y EMA 21
-    - RSI
-    - MACD con histograma
-    """
-    if df_intraday.empty or len(df_intraday) < 10:
-        return None
-
-    close = df_intraday['Close'].squeeze()
-    ema9  = close.ewm(span=9).mean()
-    ema21 = close.ewm(span=21).mean()
-    rsi   = calcular_rsi(close, 14)
-    macd, signal, histograma = calcular_macd(close)
-
-    # Colores de velas
-    colores_velas = ['#00ff88' if c >= o else '#ff4444'
-                     for c, o in zip(df_intraday['Close'], df_intraday['Open'])]
-    colores_vol   = ['#00ff88' if c >= o else '#ff4444'
-                     for c, o in zip(df_intraday['Close'], df_intraday['Open'])]
-    colores_hist  = ['#00ff88' if v >= 0 else '#ff4444' for v in histograma]
-
-    fig = make_subplots(
-        rows=4, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.03,
-        row_heights=[0.50, 0.15, 0.18, 0.17],
-        subplot_titles=(
-            f"📈 {nombre} ({ticker}) — Velas 1D",
-            "📊 Volumen",
-            "⚡ RSI (14)",
-            "📉 MACD (12,26,9)"
-        )
-    )
-
-    # ── PANEL 1: Velas + EMAs ──
-    fig.add_trace(go.Candlestick(
-        x=df_intraday.index,
-        open=df_intraday['Open'],
-        high=df_intraday['High'],
-        low=df_intraday['Low'],
-        close=df_intraday['Close'],
-        name="Precio",
-        increasing_line_color='#00ff88',
-        decreasing_line_color='#ff4444',
-        increasing_fillcolor='#00ff88',
-        decreasing_fillcolor='#ff4444',
-    ), row=1, col=1)
-
-    fig.add_trace(go.Scatter(
-        x=df_intraday.index, y=ema9,
-        name="EMA 9", line=dict(color='#FFD700', width=1.5, dash='solid')
-    ), row=1, col=1)
-
-    fig.add_trace(go.Scatter(
-        x=df_intraday.index, y=ema21,
-        name="EMA 21", line=dict(color='#00BFFF', width=1.5, dash='solid')
-    ), row=1, col=1)
-
-    # ── PANEL 2: Volumen ──
-    fig.add_trace(go.Bar(
-        x=df_intraday.index,
-        y=df_intraday['Volume'],
-        name="Volumen",
-        marker_color=colores_vol,
-        opacity=0.7
-    ), row=2, col=1)
-
-    # ── PANEL 3: RSI ──
-    fig.add_trace(go.Scatter(
-        x=df_intraday.index, y=rsi,
-        name="RSI", line=dict(color='#DA70D6', width=2)
-    ), row=3, col=1)
-
-    # Zonas RSI
-    fig.add_hrect(y0=70, y1=100, fillcolor="#ff4444", opacity=0.1,
-                  line_width=0, row=3, col=1)
-    fig.add_hrect(y0=0, y1=30, fillcolor="#00ff88", opacity=0.1,
-                  line_width=0, row=3, col=1)
-    fig.add_hline(y=70, line_dash="dot", line_color="#ff4444",
-                  line_width=1, row=3, col=1)
-    fig.add_hline(y=30, line_dash="dot", line_color="#00ff88",
-                  line_width=1, row=3, col=1)
-    fig.add_hline(y=50, line_dash="dot", line_color="#888888",
-                  line_width=1, row=3, col=1)
-
-    # ── PANEL 4: MACD ──
-    fig.add_trace(go.Bar(
-        x=df_intraday.index, y=histograma,
-        name="Histograma", marker_color=colores_hist, opacity=0.7
-    ), row=4, col=1)
-
-    fig.add_trace(go.Scatter(
-        x=df_intraday.index, y=macd,
-        name="MACD", line=dict(color='#00BFFF', width=1.5)
-    ), row=4, col=1)
-
-    fig.add_trace(go.Scatter(
-        x=df_intraday.index, y=signal,
-        name="Signal", line=dict(color='#FF8C00', width=1.5)
-    ), row=4, col=1)
-
-    fig.add_hline(y=0, line_dash="dot", line_color="#888888",
-                  line_width=1, row=4, col=1)
-
-    # ── ESTILO OSCURO PROFESIONAL ──
-    fig.update_layout(
-        height=750,
-        paper_bgcolor='#0f0c29',
-        plot_bgcolor='#0f0c29',
-        font=dict(color='#ffffff', size=11),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom", y=1.02,
-            xanchor="right", x=1,
-            bgcolor='rgba(0,0,0,0.3)',
-            font=dict(size=10)
-        ),
-        margin=dict(l=10, r=10, t=40, b=10),
-        xaxis_rangeslider_visible=False,
-    )
-
-    # Grids y ejes
-    for i in range(1, 5):
-        fig.update_xaxes(
-            showgrid=True, gridcolor='#1e1e3a',
-            zeroline=False, row=i, col=1,
-            showspikes=True, spikecolor="#00ff88",
-            spikethickness=1, spikemode="across"
-        )
-        fig.update_yaxes(
-            showgrid=True, gridcolor='#1e1e3a',
-            zeroline=False, row=i, col=1,
-            tickfont=dict(size=9)
-        )
-
-    # RSI rango fijo
-    fig.update_yaxes(range=[0, 100], row=3, col=1)
-
-    return fig
-
-
+# ─────────────────────────────────────────────
+# MOTOR HMM
+# ─────────────────────────────────────────────
 class MaquinaDineroLino:
     def __init__(self):
         self.modelo = hmm.GaussianHMM(
@@ -256,31 +261,27 @@ class MaquinaDineroLino:
 
     def analizar(self, ticker):
         try:
-            t = yf.Ticker(ticker)
-            df = t.history(period="2y")
+            t  = yf.Ticker(ticker)
+            df = t.history(period="2y", interval="1d")
             if df.empty or len(df) < 60:
-                return None, "No hay suficientes datos"
+                return None, "No hay suficientes datos historicos"
 
-            close = df["Close"].squeeze()
+            close       = df["Close"].squeeze()
             retornos    = np.log(close / close.shift(1)).dropna()
             volatilidad = retornos.rolling(5).std().dropna()
             momentum    = close.pct_change(5).dropna()
-
-            min_len = min(len(retornos), len(volatilidad), len(momentum))
+            min_len     = min(len(retornos), len(volatilidad), len(momentum))
             X = np.column_stack([
                 retornos.values[-min_len:],
                 volatilidad.values[-min_len:],
                 momentum.values[-min_len:]
             ])
-
             self.modelo.fit(X)
-            _, states = self.modelo.decode(X, algorithm="viterbi")
-
-            means       = self.modelo.means_[:, 0]
-            bull_state  = int(np.argmax(means))
-            bear_state  = int(np.argmin(means))
+            _, states     = self.modelo.decode(X, algorithm="viterbi")
+            means         = self.modelo.means_[:, 0]
+            bull_state    = int(np.argmax(means))
+            bear_state    = int(np.argmin(means))
             estado_actual = int(states[-1])
-
             if estado_actual == bull_state:
                 estado_hmm = "ALCISTA"
             elif estado_actual == bear_state:
@@ -288,195 +289,350 @@ class MaquinaDineroLino:
             else:
                 estado_hmm = "LATERAL"
 
-            rsi_serie       = calcular_rsi(close)
-            rsi             = rsi_serie.iloc[-1]
-            macd, signal, _ = calcular_macd(close)
-            macd_val        = macd.iloc[-1]
-            signal_val      = signal.iloc[-1]
+            rsi_serie        = calcular_rsi(close)
+            rsi              = rsi_serie.iloc[-1]
+            stoch_k, stoch_d = calcular_stoch_rsi(close)
+            sk, sd           = stoch_k.iloc[-1], stoch_d.iloc[-1]
+            macd, signal, _  = calcular_macd(close)
+            macd_val         = macd.iloc[-1]
+            signal_val       = signal.iloc[-1]
 
-            # Precio en tiempo real (fast_info — sin latencia)
+            df_chart    = t.history(period="3mo", interval="1d")
+            agotamiento = detectar_divergencia_volumen(df_chart)
+            velas_rev   = detectar_vela_rebote(df_chart.tail(10))
+
+            _, _, bb_low_s = calcular_bollinger(close)
+            bb_low_val     = bb_low_s.iloc[-1]
+
             precio_rt, cambio_rt = obtener_precio_realtime(ticker)
             if precio_rt:
                 precio_actual = precio_rt
                 cambio        = cambio_rt
             else:
                 precio_actual = float(close.iloc[-1])
-                precio_ayer   = float(close.iloc[-2])
-                cambio        = ((precio_actual - precio_ayer) / precio_ayer) * 100
+                cambio = ((precio_actual - float(close.iloc[-2])) / float(close.iloc[-2])) * 100
 
-            score = calcular_score_final(estado_hmm, rsi, macd_val, signal_val, cambio)
+            precio_vs_bb = ((precio_actual - bb_low_val) / bb_low_val) * 100
 
-            if score >= 65:
-                señal  = "🟢 ENTRAR — COMPRAR"
+            score, razones, alertas = calcular_score_rebote(
+                estado_hmm, rsi, sk, sd,
+                macd_val, signal_val,
+                agotamiento, velas_rev, precio_vs_bb
+            )
+
+            niveles = calcular_niveles_trading(df_chart, precio_actual)
+
+            if score >= 70:
+                senal  = "ENTRAR — REBOTE PROBABLE"
                 color  = "#00ff88"
-                accion = "COMPRAR"
-            elif score <= 35:
-                señal  = "🔴 SALIR — VENDER"
+            elif score >= 55:
+                senal  = "PREPARARSE — REBOTE POSIBLE"
+                color  = "#FFD700"
+            elif score <= 30:
+                senal  = "NO ENTRAR — TENDENCIA BAJISTA"
                 color  = "#ff4444"
-                accion = "VENDER"
             else:
-                señal  = "🟡 ESPERAR — NO OPERAR"
-                color  = "#ffcc00"
-                accion = "ESPERAR"
+                senal  = "NEUTRO — SIN SENAL CLARA"
+                color  = "#FF8C00"
 
-            # Backtesting simple
-            señales_bt = []
-            for i in range(26, len(close)):
-                r        = calcular_rsi(close.iloc[:i+1]).iloc[-1]
-                m, s, _  = calcular_macd(close.iloc[:i+1])
-                mv, sv   = m.iloc[-1], s.iloc[-1]
-                c        = ((close.iloc[i] - close.iloc[i-1]) / close.iloc[i-1]) * 100
-                sc       = calcular_score_final(estado_hmm, r, mv, sv, c)
-                señales_bt.append(sc)
+            # Backtesting
+            senales_bt = []
+            for i in range(30, len(close)):
+                r            = calcular_rsi(close.iloc[:i+1]).iloc[-1]
+                sk_bt, sd_bt = calcular_stoch_rsi(close.iloc[:i+1])
+                sk_v         = sk_bt.iloc[-1]
+                sd_v         = sd_bt.iloc[-1]
+                m, s, _      = calcular_macd(close.iloc[:i+1])
+                mv, sv       = m.iloc[-1], s.iloc[-1]
+                c_val        = ((close.iloc[i] - close.iloc[i-1]) / close.iloc[i-1]) * 100
+                sc, _, _     = calcular_score_rebote(
+                    estado_hmm, r, sk_v, sd_v, mv, sv, (False, 0), [], 0
+                )
+                senales_bt.append(sc)
 
-            señales_series = pd.Series(señales_bt)
-            compras = (señales_series >= 65).sum()
-            ventas  = (señales_series <= 35).sum()
-            total   = len(señales_series)
-
-            # Datos intradía para gráfica (1 año, velas diarias)
-            df_chart = t.history(period="1y", interval="1d")
+            senales_series = pd.Series(senales_bt)
+            compras = (senales_series >= 70).sum()
+            ventas  = (senales_series <= 30).sum()
+            total   = len(senales_series)
 
             return {
-                "señal": señal, "score": score, "color": color,
-                "accion": accion, "estado_hmm": estado_hmm,
+                "senal": senal, "score": score, "color": color,
+                "estado_hmm": estado_hmm,
                 "precio": precio_actual, "cambio": cambio,
                 "rsi": round(rsi, 1),
-                "macd": round(macd_val, 4),
-                "signal": round(signal_val, 4),
-                "compras_bt": compras,
-                "ventas_bt": ventas,
-                "total_bt": total,
-                "close": close,
-                "df_chart": df_chart,
-                "datos": len(df)
+                "stoch_k": round(sk, 1), "stoch_d": round(sd, 1),
+                "macd": round(macd_val, 4), "signal_line": round(signal_val, 4),
+                "agotamiento": agotamiento,
+                "velas_rev": velas_rev,
+                "razones": razones, "alertas": alertas,
+                "niveles": niveles,
+                "compras_bt": compras, "ventas_bt": ventas, "total_bt": total,
+                "close": close, "df_chart": df_chart, "datos": len(df)
             }, None
 
         except Exception as e:
             return None, str(e)
 
+# ─────────────────────────────────────────────
+# GRAFICA PROFESIONAL
+# ─────────────────────────────────────────────
+def grafica_rebote_profesional(df, ticker, nombre, niveles, velas_rev):
+    if df.empty or len(df) < 10:
+        return None
+
+    close            = df['Close'].squeeze()
+    ema9             = close.ewm(span=9).mean()
+    ema21            = close.ewm(span=21).mean()
+    stoch_k, stoch_d = calcular_stoch_rsi(close)
+    macd, signal, hist = calcular_macd(close)
+    bb_up, _, bb_low = calcular_bollinger(close)
+
+    colores_velas = ['#00ff88' if c >= o else '#ff4444'
+                     for c, o in zip(df['Close'], df['Open'])]
+    colores_hist  = ['#00ff88' if v >= 0 else '#ff4444' for v in hist]
+
+    fig = make_subplots(
+        rows=4, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.02,
+        row_heights=[0.48, 0.14, 0.19, 0.19],
+        subplot_titles=(
+            f"Velas Diarias — {nombre} ({ticker})",
+            "Volumen",
+            "Stoch RSI — Señal de Rebote",
+            "MACD"
+        )
+    )
+
+    # Panel 1: Velas + Bollinger + EMAs + Niveles
+    fig.add_trace(go.Candlestick(
+        x=df.index,
+        open=df['Open'], high=df['High'],
+        low=df['Low'],   close=df['Close'],
+        name="Precio",
+        increasing_line_color='#00ff88', decreasing_line_color='#ff4444',
+        increasing_fillcolor='#00ff88',  decreasing_fillcolor='#ff4444',
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=df.index, y=bb_up, name="BB Superior",
+        line=dict(color='#555577', width=1, dash='dot')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=bb_low, name="BB Inferior",
+        line=dict(color='#335577', width=1, dash='dot'),
+        fill='tonexty', fillcolor='rgba(0,100,255,0.05)'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=ema9,  name="EMA 9",
+        line=dict(color='#FFD700', width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=ema21, name="EMA 21",
+        line=dict(color='#00BFFF', width=1.5)), row=1, col=1)
+
+    # Niveles de trading
+    primer_idx = df.index[max(0, len(df)-30)]
+    ultimo_idx = df.index[-1]
+    for y_val, color, etiqueta in [
+        (niveles['entrada'],    '#00ff88', f"Entrada ${niveles['entrada']:.2f}"),
+        (niveles['stop_loss'],  '#ff4444', f"Stop ${niveles['stop_loss']:.2f}"),
+        (niveles['objetivo_1'], '#FFD700', f"T1 ${niveles['objetivo_1']:.2f}"),
+        (niveles['objetivo_2'], '#00BFFF', f"T2 ${niveles['objetivo_2']:.2f}"),
+    ]:
+        fig.add_shape(type="line",
+            x0=primer_idx, x1=ultimo_idx, y0=y_val, y1=y_val,
+            line=dict(color=color, width=1.5, dash="dash"), row=1, col=1)
+        fig.add_annotation(x=ultimo_idx, y=y_val, text=etiqueta,
+            showarrow=False, xanchor="right",
+            font=dict(color=color, size=10),
+            bgcolor="rgba(0,0,0,0.5)", row=1, col=1)
+
+    # Marcadores de velas
+    for fecha, tipo_vela, color_vela in velas_rev[-3:]:
+        if fecha in df.index:
+            precio_vela = float(df.loc[fecha, 'Low']) * 0.998
+            fig.add_trace(go.Scatter(
+                x=[fecha], y=[precio_vela],
+                mode='markers+text',
+                marker=dict(symbol='triangle-up', size=14, color=color_vela),
+                text=[tipo_vela], textposition="bottom center",
+                textfont=dict(size=9, color=color_vela),
+                name=tipo_vela, showlegend=False
+            ), row=1, col=1)
+
+    # Panel 2: Volumen
+    fig.add_trace(go.Bar(x=df.index, y=df['Volume'],
+        name="Volumen", marker_color=colores_velas, opacity=0.7), row=2, col=1)
+    vol_avg = df['Volume'].rolling(20).mean()
+    fig.add_trace(go.Scatter(x=df.index, y=vol_avg, name="Vol MA20",
+        line=dict(color='#888888', width=1, dash='dot')), row=2, col=1)
+
+    # Panel 3: Stoch RSI
+    fig.add_trace(go.Scatter(x=df.index, y=stoch_k,
+        name="Stoch K", line=dict(color='#00ff88', width=2)), row=3, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=stoch_d,
+        name="Stoch D", line=dict(color='#ff4444', width=1.5, dash='dot')), row=3, col=1)
+    fig.add_hrect(y0=80, y1=100, fillcolor="#ff4444", opacity=0.08, line_width=0, row=3, col=1)
+    fig.add_hrect(y0=0,  y1=20,  fillcolor="#00ff88", opacity=0.08, line_width=0, row=3, col=1)
+    fig.add_hline(y=80, line_dash="dot", line_color="#ff4444", line_width=1, row=3, col=1)
+    fig.add_hline(y=20, line_dash="dot", line_color="#00ff88", line_width=1, row=3, col=1)
+
+    # Panel 4: MACD
+    fig.add_trace(go.Bar(x=df.index, y=hist,
+        name="Histograma", marker_color=colores_hist, opacity=0.7), row=4, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=macd,   name="MACD",
+        line=dict(color='#00BFFF', width=1.5)), row=4, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=signal, name="Signal",
+        line=dict(color='#FF8C00', width=1.5)), row=4, col=1)
+    fig.add_hline(y=0, line_dash="dot", line_color="#888888", line_width=1, row=4, col=1)
+
+    fig.update_layout(
+        height=820,
+        paper_bgcolor='#0f0c29', plot_bgcolor='#0f0c29',
+        font=dict(color='#ffffff', size=11),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01,
+                    xanchor="right", x=1,
+                    bgcolor='rgba(0,0,0,0.4)', font=dict(size=9)),
+        margin=dict(l=10, r=10, t=50, b=10),
+        xaxis_rangeslider_visible=False,
+    )
+    for i in range(1, 5):
+        fig.update_xaxes(showgrid=True, gridcolor='#1a1a2e', zeroline=False,
+                         showspikes=True, spikecolor="#00ff88",
+                         spikethickness=1, spikemode="across", row=i, col=1)
+        fig.update_yaxes(showgrid=True, gridcolor='#1a1a2e', zeroline=False,
+                         tickfont=dict(size=9), row=i, col=1)
+    fig.update_yaxes(range=[0, 100], row=3, col=1)
+    return fig
 
 # ─────────────────────────────────────────────
 # INTERFAZ
 # ─────────────────────────────────────────────
+if "ticker_sel" not in st.session_state: st.session_state.ticker_sel = ""
+if "nombre_sel" not in st.session_state: st.session_state.nombre_sel = ""
+if "pais_sel"   not in st.session_state: st.session_state.pais_sel   = ""
 
-# Session state para ticker seleccionado
-if "ticker_sel"  not in st.session_state:
-    st.session_state.ticker_sel  = ""
-if "nombre_sel"  not in st.session_state:
-    st.session_state.nombre_sel  = ""
-if "pais_sel"    not in st.session_state:
-    st.session_state.pais_sel    = ""
-if "sugerencias" not in st.session_state:
-    st.session_state.sugerencias = []
+col_s, col_b = st.columns([4, 1])
+with col_s:
+    busqueda = st.text_input("Escribe empresa o ticker:",
+        placeholder="Ej: Tesla, Apple, FEMSA, Cemex, Bitcoin...")
+with col_b:
+    st.write(""); st.write("")
+    buscar_btn = st.button("ANALIZAR", use_container_width=True)
 
-# Búsqueda con autocompletado
-col_search, col_btn = st.columns([4, 1])
-
-with col_search:
-    busqueda = st.text_input(
-        "🔍 Escribe empresa o ticker:",
-        placeholder="Ej: Tesla, Apple, FEMSA, Cemex, Bitcoin...",
-        key="input_busqueda"
-    )
-
-with col_btn:
-    st.write("")
-    st.write("")
-    buscar_btn = st.button("🚀 ANALIZAR", use_container_width=True)
-
-# Autocompletado — muestra sugerencias mientras escribe
+# Autocompletado
 if busqueda and len(busqueda) >= 2 and not buscar_btn:
     with st.spinner("Buscando..."):
-        sugerencias = buscar_sugerencias(busqueda)
-
-    if sugerencias:
-        st.markdown("**Selecciona el activo:**")
-        opciones = [s["label"] for s in sugerencias]
-        seleccion = st.radio("", opciones, key="radio_sug", label_visibility="collapsed")
-
-        # Guardar selección en session_state
+        sugs = buscar_sugerencias(busqueda)
+    if sugs:
+        opciones  = [s["label"] for s in sugs]
+        seleccion = st.radio("Selecciona el activo:", opciones,
+                             key="radio_sug", label_visibility="visible")
         idx = opciones.index(seleccion)
-        st.session_state.ticker_sel = sugerencias[idx]["ticker"]
-        st.session_state.nombre_sel = sugerencias[idx]["nombre"]
-        st.session_state.pais_sel   = sugerencias[idx]["pais"]
+        st.session_state.ticker_sel = sugs[idx]["ticker"]
+        st.session_state.nombre_sel = sugs[idx]["nombre"]
+        st.session_state.pais_sel   = sugs[idx]["pais"]
+        st.info(f"Seleccionado: **{st.session_state.nombre_sel}** "
+                f"`{st.session_state.ticker_sel}` {st.session_state.pais_sel}")
 
-        st.info(f"Seleccionado: **{st.session_state.nombre_sel}** `{st.session_state.ticker_sel}` {st.session_state.pais_sel}")
-
-# Auto-refresh opcional
-col_r1, col_r2 = st.columns([1, 5])
+col_r1, _ = st.columns([1, 5])
 with col_r1:
-    auto_refresh = st.checkbox("🔄 Auto-refresh 15 min")
+    auto_refresh = st.checkbox("Auto-refresh 15 min")
 if auto_refresh:
-    import time
-    st.info("🔄 Actualizando cada 15 minutos...")
-    time.sleep(900)
-    st.rerun()
+    import time; time.sleep(900); st.rerun()
 
-# ── EJECUTAR ANÁLISIS ──
 ticker_a_usar = st.session_state.ticker_sel or busqueda.upper().strip()
 nombre_a_usar = st.session_state.nombre_sel or busqueda
 
 if buscar_btn and ticker_a_usar:
-    with st.spinner("🤖 AI.Lino analizando con HMM Viterbi..."):
-        maquina  = MaquinaDineroLino()
+    with st.spinner("AI.Lino analizando rebote..."):
+        maquina          = MaquinaDineroLino()
         resultado, error = maquina.analizar(ticker_a_usar)
 
     if error:
-        st.error(f"❌ Error: {error}")
+        st.error(f"Error: {error}")
     elif resultado:
 
-        # ── SEÑAL PRINCIPAL ──
+        # Señal principal
         st.markdown(f"""
         <div style='background: linear-gradient(135deg, #0f0c29, #302b63); 
              padding: 30px; border-radius: 15px; text-align: center;
              border: 3px solid {resultado["color"]}; margin: 15px 0;'>
-            <h1 style='color: {resultado["color"]}; font-size: 3em;'>{resultado["señal"]}</h1>
+            <h1 style='color: {resultado["color"]}; font-size: 2.8em;'>{resultado["senal"]}</h1>
             <h2 style='color: white;'>Score AI.LINO: {resultado["score"]}/100</h2>
-            <h3 style='color: #aaaaaa;'>💰 Precio en tiempo real: 
-            <span style='color: white; font-weight: bold;'>${resultado["precio"]:.2f}</span>
-            <span style='color: {"#00ff88" if resultado["cambio"] > 0 else "#ff4444"}'>
+            <h3 style='color: #aaaaaa;'>Precio en tiempo real:
+            <span style='color:white; font-weight:bold'> ${resultado["precio"]:.2f}</span>
+            <span style='color:{"#00ff88" if resultado["cambio"]>0 else "#ff4444"}'>
             ({resultado["cambio"]:+.2f}%)</span></h3>
         </div>
         """, unsafe_allow_html=True)
 
-        # ── INDICADORES ──
-        st.markdown("### 📊 Indicadores")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("🧠 HMM Viterbi", resultado["estado_hmm"])
-        c2.metric("📈 RSI (14)", resultado["rsi"],
-                  "⚠️ Sobrecompra" if resultado["rsi"] > 70 else
-                  "✅ Sobreventa"  if resultado["rsi"] < 30 else "Neutral")
-        macd_diff = round(resultado["macd"] - resultado["signal"], 4)
-        c3.metric("📉 MACD", resultado["macd"], f"vs Signal: {macd_diff:+.4f}")
-        c4.metric("📅 Datos históricos", f"{resultado['datos']} días")
+        # Niveles de trading
+        niv = resultado["niveles"]
+        st.markdown("### Niveles de Trading")
+        n1, n2, n3, n4, n5 = st.columns(5)
+        n1.metric("Entrada Ideal",     f"${niv['entrada']:.2f}")
+        n2.metric("Stop Loss",         f"${niv['stop_loss']:.2f}",
+                  delta=f"-{niv['riesgo_pct']:.1f}%", delta_color="inverse")
+        n3.metric("Objetivo 1",        f"${niv['objetivo_1']:.2f}")
+        n4.metric("Objetivo 2",        f"${niv['objetivo_2']:.2f}",
+                  delta=f"+{niv['pot_ganancia']:.1f}%")
+        n5.metric("Riesgo / Beneficio", f"1 : {niv['rr_ratio']:.1f}")
+        st.caption(f"ATR: ${niv['atr']:.2f} | Soporte: ${niv['soporte']:.2f} | "
+                   f"Resistencia: ${niv['resistencia']:.2f} | BB Inferior: ${niv['bb_low']:.2f}")
 
-        # ── BACKTESTING ──
-        st.markdown("### 🔬 Backtesting (2 años)")
+        # Señales de rebote
+        st.markdown("### Analisis de Rebote")
+        col_r, col_a = st.columns(2)
+        with col_r:
+            st.markdown("**Senales a Favor**")
+            for r in resultado["razones"]:
+                st.success(r)
+        with col_a:
+            st.markdown("**Alertas**")
+            for a in resultado["alertas"]:
+                st.warning(a)
+
+        agot = resultado["agotamiento"]
+        if agot[0]:
+            st.success(f"Agotamiento de vendedores confirmado — volumen cae {agot[1]}% — Rebote probable")
+        else:
+            st.warning("Agotamiento de vendedores no confirmado — esperar mas senales")
+
+        if resultado["velas_rev"]:
+            velas_str = " | ".join([v[1] for v in resultado["velas_rev"][-3:]])
+            st.success(f"Patrones de vela detectados: {velas_str}")
+
+        # Indicadores
+        st.markdown("### Indicadores")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("HMM Viterbi", resultado["estado_hmm"])
+        c2.metric("RSI",         resultado["rsi"],
+                  "Sobreventa" if resultado["rsi"] < 35 else
+                  "Sobrecompra" if resultado["rsi"] > 70 else "Neutral")
+        c3.metric("Stoch RSI K", resultado["stoch_k"],
+                  "Zona rebote" if resultado["stoch_k"] < 20 else
+                  "Sobrecompra" if resultado["stoch_k"] > 80 else "")
+        c4.metric("MACD",        resultado["macd"],
+                  f"Signal: {resultado['signal_line']}")
+        c5.metric("Datos",       f"{resultado['datos']} dias")
+
+        # Backtesting
+        st.markdown("### Backtesting (2 anos)")
         b1, b2, b3 = st.columns(3)
-        b1.metric("🟢 Señales Compra", resultado["compras_bt"])
-        b2.metric("🔴 Señales Venta",  resultado["ventas_bt"])
-        pct = round((resultado["compras_bt"] + resultado["ventas_bt"]) / resultado["total_bt"] * 100, 1)
-        b3.metric("⚡ Actividad total", f"{pct}%")
+        b1.metric("Senales Compra",    resultado["compras_bt"])
+        b2.metric("Senales No Entrar", resultado["ventas_bt"])
+        pct = round((resultado["compras_bt"] + resultado["ventas_bt"]) /
+                    resultado["total_bt"] * 100, 1)
+        b3.metric("Actividad", f"{pct}%")
 
-        # ── GRÁFICA PROFESIONAL DE VELAS ──
-        st.markdown("### 📈 Gráfica Profesional — Velas Diarias + RSI + MACD")
-
-        fig = grafica_trading_profesional(
-            resultado["df_chart"],
-            ticker_a_usar,
-            nombre_a_usar
+        # Grafica
+        st.markdown("### Grafica con Niveles de Entrada y Salida")
+        fig = grafica_rebote_profesional(
+            resultado["df_chart"], ticker_a_usar,
+            nombre_a_usar, niv, resultado["velas_rev"]
         )
-
         if fig:
             st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.line_chart(resultado["close"])
 
-        st.caption(f"🤖 AI.LINO Pro | HMM Viterbi + RSI + MACD | {ticker_a_usar} | Precio en tiempo real vía fast_info")
+        st.caption(f"AI.LINO Pro | HMM + Stoch RSI + Volumen + Rebote | {ticker_a_usar}")
 
 st.markdown("---")
 st.markdown(
-    "<p style='text-align:center; color:#555;'>🤖 AI.Lino Pro © 2026 — Herramienta educativa. Opera con responsabilidad.</p>",
+    "<p style='text-align:center; color:#555;'>AI.Lino Pro 2026 — Herramienta educativa. No es asesoria financiera.</p>",
     unsafe_allow_html=True
 )
