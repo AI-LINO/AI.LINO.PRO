@@ -1,4 +1,4 @@
-1import streamlit as st
+import streamlit as st
 import yfinance as yf
 import numpy as np
 from hmmlearn import hmm
@@ -93,16 +93,319 @@ def calcular_bollinger(precios, periodo=20):
     return media + 2*std, media, media - 2*std
 
 # ─────────────────────────────────────────────
+# ██████████████████████████████████████████████
+# MÓDULO NUEVO: DETECTOR DE PISO INTRADÍA
+# ██████████████████████████████████████████████
+# ─────────────────────────────────────────────
+def detectar_piso_intraday(ticker):
+    """
+    Detecta el piso intradía en tiempo real usando velas de 5 minutos.
+    
+    Lógica:
+    1. Caída de precio + caída de volumen simultánea = vendedores agotándose
+    2. Vela de rechazo (mecha inferior larga) en zona de soporte
+    3. Stoch RSI en sobreventa extrema en timeframe corto
+    
+    Retorna: dict con señal, precio_piso, stop, objetivo, confianza
+    """
+    try:
+        t       = yf.Ticker(ticker)
+        # Velas de 5 minutos — últimas 2 sesiones
+        df_5m   = t.history(period="2d", interval="5m")
+        # Velas de 1 hora — última semana para niveles
+        df_1h   = t.history(period="5d", interval="1h")
+
+        if df_5m.empty or len(df_5m) < 20:
+            return {"error": "Sin datos intradía suficientes"}
+
+        close_5m  = df_5m['Close'].squeeze()
+        volume_5m = df_5m['Volume'].squeeze()
+        high_5m   = df_5m['High'].squeeze()
+        low_5m    = df_5m['Low'].squeeze()
+        open_5m   = df_5m['Open'].squeeze()
+
+        precio_actual = float(close_5m.iloc[-1])
+        puntos        = 0
+        señales       = []
+        alertas_id    = []
+
+        # ── CONDICIÓN 1: Caída de precio + caída de volumen ──
+        # Buscar secuencia de 3+ velas bajistas con volumen decreciente
+        bajistas_consecutivas = 0
+        vol_decreciente       = True
+        for i in range(-6, -1):
+            if float(close_5m.iloc[i]) < float(close_5m.iloc[i-1]):
+                bajistas_consecutivas += 1
+                if i < -2 and float(volume_5m.iloc[i]) > float(volume_5m.iloc[i-1]):
+                    vol_decreciente = False
+            else:
+                bajistas_consecutivas = 0
+                vol_decreciente       = True
+
+        if bajistas_consecutivas >= 3 and vol_decreciente:
+            puntos += 3
+            señales.append(f"🔴 Caída {bajistas_consecutivas} velas con volumen decreciente — vendedores agotándose")
+        elif bajistas_consecutivas >= 2:
+            puntos += 1
+            señales.append(f"⚠️ Presión bajista ({bajistas_consecutivas} velas) — vigilar volumen")
+
+        # Caída de volumen general en últimas 5 velas vs 10 anteriores
+        vol_rec = float(volume_5m.iloc[-5:].mean())
+        vol_ant = float(volume_5m.iloc[-15:-5].mean())
+        if vol_ant > 0 and vol_rec < vol_ant * 0.70:
+            reduccion_vol = ((vol_ant - vol_rec) / vol_ant) * 100
+            puntos += 2
+            señales.append(f"📉 Volumen cayó {reduccion_vol:.0f}% en últimas 5 velas — vendedores secándose")
+
+        # ── CONDICIÓN 2: Vela de rechazo (mecha inferior larga) ──
+        rechazos_5m = 0
+        for i in range(-4, 0):
+            o = float(open_5m.iloc[i])
+            h = float(high_5m.iloc[i])
+            l = float(low_5m.iloc[i])
+            c = float(close_5m.iloc[i])
+            cuerpo    = abs(c - o) + 1e-10
+            mecha_inf = min(o, c) - l
+            rango     = h - l + 1e-10
+            # Hammer o Pin Bar: mecha inferior > 2x cuerpo y ocupa >35% del rango
+            if mecha_inf > cuerpo * 1.8 and mecha_inf / rango > 0.35:
+                rechazos_5m += 1
+            # Doji (indecisión)
+            elif cuerpo / rango < 0.15 and rango > 0:
+                rechazos_5m += 0.5
+
+        if rechazos_5m >= 2:
+            puntos += 3
+            señales.append(f"🕯️ {int(rechazos_5m)} velas de rechazo en mínimos — compradores defendiendo")
+        elif rechazos_5m >= 1:
+            puntos += 2
+            señales.append("🕯️ Vela de rechazo detectada — posible piso")
+
+        # ── CONDICIÓN 3: Stoch RSI en sobreventa intradía ──
+        if len(close_5m) >= 20:
+            stoch_k_5m, stoch_d_5m = calcular_stoch_rsi(close_5m, periodo=14, smooth=3)
+            sk_actual = float(stoch_k_5m.iloc[-1])
+            sd_actual = float(stoch_d_5m.iloc[-1])
+
+            if sk_actual < 10:
+                puntos += 3
+                señales.append(f"📊 Stoch RSI intradía extremo ({sk_actual:.1f}) — rebote inminente")
+            elif sk_actual < 20:
+                puntos += 2
+                señales.append(f"📊 Stoch RSI intradía en sobreventa ({sk_actual:.1f}) — zona de rebote")
+            elif sk_actual < 30:
+                puntos += 1
+                señales.append(f"📊 Stoch RSI bajando ({sk_actual:.1f}) — acercándose a zona rebote")
+
+            if sk_actual > sd_actual and sk_actual < 40:
+                puntos += 1
+                señales.append("📈 Stoch RSI cruzando al alza — impulso iniciando")
+        else:
+            sk_actual = 50
+            sd_actual = 50
+
+        # ── CONDICIÓN 4: Precio cerca de soporte horario ──
+        soporte_1h    = float(df_1h['Low'].squeeze().iloc[-20:].min()) if not df_1h.empty else None
+        resistencia_1h = float(df_1h['High'].squeeze().iloc[-20:].max()) if not df_1h.empty else None
+        min_dia       = float(low_5m.min())
+        max_dia       = float(high_5m.max())
+
+        # Precio dentro del 1% del mínimo del día = zona de soporte
+        if precio_actual <= min_dia * 1.01:
+            puntos += 2
+            señales.append(f"🎯 Precio cerca del mínimo del día (${min_dia:.2f}) — soporte intradía")
+
+        # Precio cerca del soporte horario
+        if soporte_1h and precio_actual <= soporte_1h * 1.015:
+            puntos += 2
+            señales.append(f"🎯 Precio en soporte horario (${soporte_1h:.2f}) — nivel clave")
+
+        # ── CONDICIÓN 5: Compresión de rangos ──
+        # Velas cada vez más pequeñas = la caída pierde momentum
+        rangos_rec = [float(high_5m.iloc[i]) - float(low_5m.iloc[i]) for i in range(-4, 0)]
+        rangos_ant = [float(high_5m.iloc[i]) - float(low_5m.iloc[i]) for i in range(-8, -4)]
+        if rangos_ant and sum(rangos_ant) > 0:
+            rango_rec_avg = sum(rangos_rec) / len(rangos_rec)
+            rango_ant_avg = sum(rangos_ant) / len(rangos_ant)
+            if rango_rec_avg < rango_ant_avg * 0.75:
+                compresion = ((rango_ant_avg - rango_rec_avg) / rango_ant_avg) * 100
+                puntos += 2
+                señales.append(f"🔇 Rango comprimido {compresion:.0f}% — la caída pierde velocidad")
+
+        # ── NIVELES DE OPERACIÓN INTRADÍA ──
+        atr_5m    = float((high_5m - low_5m).rolling(14).mean().iloc[-1])
+        entrada   = round(precio_actual, 2)
+        stop_loss = round(min_dia - atr_5m * 0.5, 2)
+        objetivo1 = round(precio_actual + atr_5m * 2, 2)
+        objetivo2 = round(precio_actual + atr_5m * 4, 2)
+        riesgo    = round(((precio_actual - stop_loss) / precio_actual) * 100, 2)
+        ganancia  = round(((objetivo1 - precio_actual) / precio_actual) * 100, 2)
+        rr        = round(ganancia / riesgo, 1) if riesgo > 0 else 0
+
+        # ── ALERTAS ──
+        rsi_5m = calcular_rsi(close_5m).iloc[-1]
+        if rsi_5m > 60:
+            alertas_id.append(f"⚠️ RSI intradía elevado ({rsi_5m:.1f}) — no es zona de compra")
+        if bajistas_consecutivas == 0:
+            alertas_id.append("ℹ️ No hay tendencia bajista activa — esperar corrección")
+
+        # ── DECISIÓN FINAL ──
+        if puntos >= 10:
+            nivel     = "FUERTE"
+            color     = "#00ff88"
+            señal_txt = "🟢 POSIBLE PISO — ENTRAR AHORA"
+            confianza = min(95, 60 + puntos * 2)
+        elif puntos >= 7:
+            nivel     = "MODERADO"
+            color     = "#FFD700"
+            señal_txt = "🟡 PISO PROBABLE — PREPARARSE"
+            confianza = min(75, 45 + puntos * 2)
+        elif puntos >= 4:
+            nivel     = "DEBIL"
+            color     = "#FF8C00"
+            señal_txt = "🟠 PRIMERAS SEÑALES — VIGILAR"
+            confianza = min(55, 30 + puntos * 2)
+        else:
+            nivel     = "SIN SEÑAL"
+            color     = "#ff4444"
+            señal_txt = "🔴 SIN PISO DETECTADO — ESPERAR"
+            confianza = max(10, puntos * 5)
+
+        return {
+            "señal":         señal_txt,
+            "nivel":         nivel,
+            "color":         color,
+            "puntos":        puntos,
+            "confianza":     confianza,
+            "precio_actual": precio_actual,
+            "min_dia":       min_dia,
+            "max_dia":       max_dia,
+            "soporte_1h":    soporte_1h,
+            "resistencia_1h": resistencia_1h,
+            "entrada":       entrada,
+            "stop_loss":     stop_loss,
+            "objetivo1":     objetivo1,
+            "objetivo2":     objetivo2,
+            "riesgo_pct":    riesgo,
+            "ganancia_pct":  ganancia,
+            "rr":            rr,
+            "atr_5m":        round(atr_5m, 4),
+            "stoch_k_5m":    round(sk_actual, 1),
+            "rsi_5m":        round(float(rsi_5m), 1),
+            "señales":       señales,
+            "alertas":       alertas_id,
+            "df_5m":         df_5m,
+            "df_1h":         df_1h,
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def grafica_intraday(df_5m, df_1h, niveles_id, ticker, nombre):
+    """Gráfica intradía de 5 minutos con señales de piso."""
+    if df_5m is None or df_5m.empty or len(df_5m) < 10:
+        return None
+
+    close_5m           = df_5m['Close'].squeeze()
+    stoch_k, stoch_d   = calcular_stoch_rsi(close_5m)
+    vol_ma             = df_5m['Volume'].squeeze().rolling(20).mean()
+
+    fig = make_subplots(
+        rows=3, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.02,
+        row_heights=[0.55, 0.20, 0.25],
+        subplot_titles=(
+            f"Intradía 5min — {nombre} ({ticker})",
+            "Volumen 5min",
+            "Stoch RSI 5min — Señal de Piso",
+        )
+    )
+
+    # Velas 5 min
+    fig.add_trace(go.Candlestick(
+        x=df_5m.index,
+        open=df_5m['Open'], high=df_5m['High'],
+        low=df_5m['Low'],   close=df_5m['Close'],
+        name="5min",
+        increasing_line_color='#00ff88', decreasing_line_color='#ff4444',
+        increasing_fillcolor='#00ff88',  decreasing_fillcolor='#ff4444',
+    ), row=1, col=1)
+
+    # Niveles horizontales
+    px_ini = df_5m.index[max(0, len(df_5m)-50)]
+    px_fin = df_5m.index[-1]
+    for y_val, color, etq in [
+        (niveles_id.get('entrada'),    '#00ff88', f"Entrada ${niveles_id.get('entrada', 0):.2f}"),
+        (niveles_id.get('stop_loss'),  '#ff4444', f"Stop ${niveles_id.get('stop_loss', 0):.2f}"),
+        (niveles_id.get('objetivo1'),  '#FFD700', f"T1 ${niveles_id.get('objetivo1', 0):.2f}"),
+        (niveles_id.get('objetivo2'),  '#00BFFF', f"T2 ${niveles_id.get('objetivo2', 0):.2f}"),
+        (niveles_id.get('min_dia'),    '#FF8C00', f"Mín día ${niveles_id.get('min_dia', 0):.2f}"),
+    ]:
+        if y_val:
+            fig.add_shape(type="line",
+                x0=px_ini, x1=px_fin, y0=y_val, y1=y_val,
+                line=dict(color=color, width=1.5, dash="dash"), row=1, col=1)
+            fig.add_annotation(x=px_fin, y=y_val, text=etq,
+                showarrow=False, xanchor="right",
+                font=dict(color=color, size=10),
+                bgcolor="rgba(0,0,0,0.6)", row=1, col=1)
+
+    # Soporte 1h
+    if niveles_id.get('soporte_1h'):
+        fig.add_shape(type="line",
+            x0=px_ini, x1=px_fin,
+            y0=niveles_id['soporte_1h'], y1=niveles_id['soporte_1h'],
+            line=dict(color='#9B59B6', width=2, dash="dot"), row=1, col=1)
+        fig.add_annotation(
+            x=px_ini, y=niveles_id['soporte_1h'],
+            text=f"Soporte 1h ${niveles_id['soporte_1h']:.2f}",
+            showarrow=False, xanchor="left",
+            font=dict(color='#9B59B6', size=9),
+            bgcolor="rgba(0,0,0,0.5)", row=1, col=1)
+
+    # Volumen
+    colores_vol = ['#00ff88' if c >= o else '#ff4444'
+                   for c, o in zip(df_5m['Close'], df_5m['Open'])]
+    fig.add_trace(go.Bar(x=df_5m.index, y=df_5m['Volume'],
+        name="Volumen", marker_color=colores_vol, opacity=0.7), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df_5m.index, y=vol_ma,
+        name="Vol MA20", line=dict(color='#888888', width=1, dash='dot')), row=2, col=1)
+
+    # Stoch RSI
+    fig.add_trace(go.Scatter(x=df_5m.index, y=stoch_k,
+        name="Stoch K", line=dict(color='#00ff88', width=2)), row=3, col=1)
+    fig.add_trace(go.Scatter(x=df_5m.index, y=stoch_d,
+        name="Stoch D", line=dict(color='#ff4444', width=1.5, dash='dot')), row=3, col=1)
+    fig.add_hrect(y0=0,  y1=20,  fillcolor="#00ff88", opacity=0.10, line_width=0, row=3, col=1)
+    fig.add_hrect(y0=80, y1=100, fillcolor="#ff4444", opacity=0.08, line_width=0, row=3, col=1)
+    fig.add_hline(y=20, line_dash="dot", line_color="#00ff88", line_width=1, row=3, col=1)
+    fig.add_hline(y=80, line_dash="dot", line_color="#ff4444", line_width=1, row=3, col=1)
+
+    fig.update_layout(
+        height=700,
+        paper_bgcolor='#0f0c29', plot_bgcolor='#0f0c29',
+        font=dict(color='#ffffff', size=11),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01,
+                    xanchor="right", x=1,
+                    bgcolor='rgba(0,0,0,0.4)', font=dict(size=9)),
+        margin=dict(l=10, r=10, t=50, b=10),
+        xaxis_rangeslider_visible=False,
+    )
+    for i in range(1, 4):
+        fig.update_xaxes(showgrid=True, gridcolor='#1a1a2e', zeroline=False,
+                         showspikes=True, spikecolor="#00ff88",
+                         spikethickness=1, spikemode="across", row=i, col=1)
+        fig.update_yaxes(showgrid=True, gridcolor='#1a1a2e', zeroline=False,
+                         tickfont=dict(size=9), row=i, col=1)
+    fig.update_yaxes(range=[0, 100], row=3, col=1)
+    return fig
+
+# ─────────────────────────────────────────────
 # MOTOR DE AGOTAMIENTO DE VENDEDORES (5 CAPAS)
 # ─────────────────────────────────────────────
 def detectar_agotamiento_vendedores(df):
-    """
-    Detector inteligente de agotamiento de vendedores.
-    5 capas independientes — cada una detecta una forma distinta
-    en que los vendedores pierden fuerza antes del rebote.
-
-    Retorna: (confirmado, nivel 0-3, descripcion, lista_detalles)
-    """
     if len(df) < 15:
         return False, 0, "Sin datos suficientes", []
 
@@ -114,8 +417,6 @@ def detectar_agotamiento_vendedores(df):
     puntos   = 0
     detalles = []
 
-    # ── CAPA 1: Divergencia precio-volumen clasica (3 ventanas) ──
-    # Precio baja pero volumen tambien baja = vendedores perdiendo fuerza
     for v in [3, 5, 8]:
         if len(df) >= v * 2:
             p_rec   = close.iloc[-v:].mean()
@@ -125,12 +426,8 @@ def detectar_agotamiento_vendedores(df):
             if p_rec < p_ant and vol_rec < vol_ant:
                 reduccion = ((vol_ant - vol_rec) / vol_ant) * 100
                 puntos += 1
-                detalles.append(
-                    f"Volumen cae {reduccion:.0f}% mientras precio baja (ventana {v}d)"
-                )
+                detalles.append(f"Volumen cae {reduccion:.0f}% mientras precio baja (ventana {v}d)")
 
-    # ── CAPA 2: Rechazo de precios bajos (mechas inferiores largas) ──
-    # El mercado toca minimos pero cierra arriba = compradores absorbiendo
     rechazos = 0
     for i in range(-5, 0):
         o = float(df['Open'].iloc[i])
@@ -144,15 +441,11 @@ def detectar_agotamiento_vendedores(df):
             rechazos += 1
     if rechazos >= 2:
         puntos += 2
-        detalles.append(
-            f"{rechazos} velas con rechazo de minimos — compradores absorbiendo presion"
-        )
+        detalles.append(f"{rechazos} velas con rechazo de minimos — compradores absorbiendo presion")
     elif rechazos == 1:
         puntos += 1
         detalles.append("1 vela con rechazo de minimos detectada")
 
-    # ── CAPA 3: Volumen en dias bajistas decreciendo ──
-    # Los dias de baja tienen cada vez menos volumen = vendedores secandose
     vols_bajas = []
     for i in range(-8, 0):
         if float(close.iloc[i]) < float(df['Open'].iloc[i]):
@@ -164,12 +457,8 @@ def detectar_agotamiento_vendedores(df):
         if vol_reciente < vol_anterior * 0.85:
             reduccion = ((vol_anterior - vol_reciente) / vol_anterior) * 100
             puntos += 2
-            detalles.append(
-                f"Dias bajistas con volumen {reduccion:.0f}% menor — vendedores agotandose"
-            )
+            detalles.append(f"Dias bajistas con volumen {reduccion:.0f}% menor — vendedores agotandose")
 
-    # ── CAPA 4: Compresion de rangos (momentum perdiendo fuerza) ──
-    # Velas cada vez mas pequenas = la caida pierde velocidad
     rangos_rec = [float(high.iloc[i]) - float(low.iloc[i]) for i in range(-5, 0)]
     rangos_ant = [float(high.iloc[i]) - float(low.iloc[i]) for i in range(-10, -5)]
     if rangos_ant and sum(rangos_ant) > 0:
@@ -178,23 +467,16 @@ def detectar_agotamiento_vendedores(df):
         if rango_rec < rango_ant * 0.80:
             compresion = ((rango_ant - rango_rec) / rango_ant) * 100
             puntos += 1
-            detalles.append(
-                f"Rango diario comprimido {compresion:.0f}% — la caida pierde velocidad"
-            )
+            detalles.append(f"Rango diario comprimido {compresion:.0f}% — la caida pierde velocidad")
 
-    # ── CAPA 5: Doble piso (soporte fuerte confirmado) ──
-    # El precio toca el mismo nivel 2 veces sin romperlo = piso real
     min_rec = float(low.iloc[-5:].min())
     min_ant = float(low.iloc[-15:-5].min())
     if min_ant > 0:
-        tolerancia = min_ant * 0.015  # 1.5% de tolerancia
+        tolerancia = min_ant * 0.015
         if abs(min_rec - min_ant) <= tolerancia:
             puntos += 3
-            detalles.append(
-                f"Doble piso en ${min_rec:.2f} — soporte fuerte confirmado en 2 toques"
-            )
+            detalles.append(f"Doble piso en ${min_rec:.2f} — soporte fuerte confirmado en 2 toques")
 
-    # ── DECISION FINAL ──
     if puntos >= 6:
         return True, 3, "AGOTAMIENTO FUERTE — Rebote de alta probabilidad", detalles
     elif puntos >= 4:
@@ -274,7 +556,6 @@ def calcular_score_rebote(estado_hmm, rsi, stoch_k, stoch_d,
     razones = []
     alertas = []
 
-    # HMM
     if estado_hmm == "ALCISTA":
         score += 15
         razones.append("HMM detecta regimen alcista")
@@ -284,7 +565,6 @@ def calcular_score_rebote(estado_hmm, rsi, stoch_k, stoch_d,
     else:
         razones.append("HMM lateral — posible acumulacion")
 
-    # RSI
     if rsi < 25:
         score += 25
         razones.append(f"RSI extremo ({rsi:.1f}) — sobreventa severa")
@@ -298,7 +578,6 @@ def calcular_score_rebote(estado_hmm, rsi, stoch_k, stoch_d,
         score -= 10
         alertas.append(f"RSI elevado ({rsi:.1f}) — cuidado")
 
-    # Stoch RSI
     if stoch_k < 20 and stoch_d < 20:
         score += 20
         razones.append(f"Stoch RSI extremo ({stoch_k:.1f}) — rebote inminente")
@@ -309,7 +588,6 @@ def calcular_score_rebote(estado_hmm, rsi, stoch_k, stoch_d,
         score -= 15
         alertas.append(f"Stoch RSI sobrecomprado ({stoch_k:.1f}) — salir pronto")
 
-    # MACD
     if macd_val > signal_val:
         score += 10
         razones.append("MACD sobre senal — momentum positivo")
@@ -317,7 +595,6 @@ def calcular_score_rebote(estado_hmm, rsi, stoch_k, stoch_d,
         score -= 5
         alertas.append("MACD bajo senal — presion vendedora activa")
 
-    # Agotamiento (ahora con niveles 0-3)
     if agot_nivel == 3:
         score += 25
         razones.append("Agotamiento de vendedores FUERTE confirmado")
@@ -330,12 +607,10 @@ def calcular_score_rebote(estado_hmm, rsi, stoch_k, stoch_d,
     else:
         alertas.append("Agotamiento de vendedores sin confirmar")
 
-    # Velas
     if len(velas_rebote) > 0:
         score += 15
         razones.append(f"Patron de vela: {velas_rebote[-1][1]} detectado")
 
-    # Bollinger
     if precio_vs_bb_low < 0:
         score += 15
         razones.append("Precio bajo BB inferior — zona de reversion estadistica")
@@ -395,9 +670,7 @@ class MaquinaDineroLino:
 
             df_chart = t.history(period="3mo", interval="1d")
 
-            # Agotamiento con nuevo motor de 5 capas
             agot_ok, agot_nivel, agot_desc, agot_detalles = detectar_agotamiento_vendedores(df_chart)
-
             velas_rev   = detectar_vela_rebote(df_chart.tail(10))
 
             _, _, bb_low_s = calcular_bollinger(close)
@@ -434,7 +707,6 @@ class MaquinaDineroLino:
                 senal = "NEUTRO — SIN SENAL CLARA"
                 color = "#FF8C00"
 
-            # Backtesting
             senales_bt = []
             for i in range(30, len(close)):
                 r            = calcular_rsi(close.iloc[:i+1]).iloc[-1]
@@ -473,7 +745,7 @@ class MaquinaDineroLino:
             return None, str(e)
 
 # ─────────────────────────────────────────────
-# GRAFICA PROFESIONAL
+# GRAFICA PROFESIONAL (SWING)
 # ─────────────────────────────────────────────
 def grafica_rebote_profesional(df, ticker, nombre, niveles, velas_rev):
     if df.empty or len(df) < 10:
@@ -652,7 +924,7 @@ if buscar_btn and ticker_a_usar:
         </div>
         """, unsafe_allow_html=True)
 
-        # Niveles
+        # Niveles swing
         niv = resultado["niveles"]
         st.markdown("### Niveles de Trading")
         n1, n2, n3, n4, n5 = st.columns(5)
@@ -666,7 +938,101 @@ if buscar_btn and ticker_a_usar:
         st.caption(f"ATR: ${niv['atr']:.2f} | Soporte: ${niv['soporte']:.2f} | "
                    f"Resistencia: ${niv['resistencia']:.2f} | BB Inf: ${niv['bb_low']:.2f}")
 
-        # Agotamiento de vendedores — panel detallado
+        # ══════════════════════════════════════════════════
+        # MÓDULO PISO INTRADÍA — NUEVO
+        # ══════════════════════════════════════════════════
+        st.markdown("---")
+        st.markdown("""
+        <div style='background: linear-gradient(135deg, #0a0a1a, #1a1a3e);
+             padding: 12px 20px; border-radius: 10px; border-left: 4px solid #FF8C00;
+             margin-bottom: 10px;'>
+            <h3 style='color: #FF8C00; margin: 0;'>⚡ MÓDULO PISO INTRADÍA — Velas 5 minutos</h3>
+            <p style='color: #888; margin: 4px 0 0 0; font-size: 0.85em;'>
+            Detecta el piso del día en tiempo real · Ideal para operaciones de rango intradía
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.spinner("Analizando intradía (velas 5min)..."):
+            id_result = detectar_piso_intraday(ticker_a_usar)
+
+        if "error" in id_result:
+            st.warning(f"Datos intradía no disponibles: {id_result['error']}")
+        else:
+            # Señal principal intradía
+            st.markdown(f"""
+            <div style='background: linear-gradient(135deg, #0f0c29, #1a1a3e);
+                 padding: 25px; border-radius: 12px; text-align: center;
+                 border: 3px solid {id_result["color"]}; margin: 10px 0;'>
+                <h2 style='color: {id_result["color"]}; font-size: 2em; margin: 0;'>
+                    {id_result["señal"]}
+                </h2>
+                <p style='color: #aaa; margin: 8px 0 0 0;'>
+                    Confianza intradía: 
+                    <span style='color: {id_result["color"]}; font-size: 1.3em; font-weight: bold;'>
+                        {id_result["confianza"]}%
+                    </span>
+                    &nbsp;|&nbsp; Puntos detectados: <b style='color:white'>{id_result["puntos"]}</b>/14
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Niveles intradía
+            st.markdown("#### 📍 Niveles Intradía (ATR 5min)")
+            i1, i2, i3, i4, i5 = st.columns(5)
+            i1.metric("Entrada Ahora",   f"${id_result['entrada']:.2f}")
+            i2.metric("Stop Loss",       f"${id_result['stop_loss']:.2f}",
+                      delta=f"-{id_result['riesgo_pct']:.2f}%", delta_color="inverse")
+            i3.metric("Objetivo 1",      f"${id_result['objetivo1']:.2f}",
+                      delta=f"+{id_result['ganancia_pct']:.2f}%")
+            i4.metric("Objetivo 2",      f"${id_result['objetivo2']:.2f}")
+            i5.metric("R/B Intradía",    f"1 : {id_result['rr']:.1f}")
+
+            # Info extra intradía
+            st.caption(
+                f"Mín día: ${id_result['min_dia']:.2f} | "
+                f"Máx día: ${id_result['max_dia']:.2f} | "
+                f"ATR 5min: ${id_result['atr_5m']:.3f} | "
+                f"Stoch RSI 5m: {id_result['stoch_k_5m']} | "
+                f"RSI 5m: {id_result['rsi_5m']} | "
+                + (f"Soporte 1h: ${id_result['soporte_1h']:.2f}" if id_result.get('soporte_1h') else "")
+            )
+
+            # Señales y alertas intradía
+            col_si, col_ai = st.columns(2)
+            with col_si:
+                st.markdown("**✅ Señales Detectadas**")
+                if id_result["señales"]:
+                    for s in id_result["señales"]:
+                        st.success(s)
+                else:
+                    st.info("Sin señales de piso activas")
+            with col_ai:
+                st.markdown("**⚠️ Alertas**")
+                if id_result["alertas"]:
+                    for a in id_result["alertas"]:
+                        st.warning(a)
+                else:
+                    st.success("Sin alertas críticas")
+
+            # Gráfica intradía
+            st.markdown("#### 📈 Gráfica Intradía 5 minutos")
+            fig_id = grafica_intraday(
+                id_result.get("df_5m"),
+                id_result.get("df_1h"),
+                id_result,
+                ticker_a_usar,
+                nombre_a_usar
+            )
+            if fig_id:
+                st.plotly_chart(fig_id, use_container_width=True)
+
+        st.markdown("---")
+        # ══════════════════════════════════════════════════
+        # FIN MÓDULO PISO INTRADÍA
+        # ══════════════════════════════════════════════════
+
+        # Agotamiento de vendedores
         st.markdown("### Agotamiento de Vendedores")
         nivel_colores = {0: "#ff4444", 1: "#FF8C00", 2: "#FFD700", 3: "#00ff88"}
         nivel_iconos  = {0: "Sin confirmar", 1: "Debil", 2: "Moderado", 3: "FUERTE"}
@@ -687,12 +1053,10 @@ if buscar_btn and ticker_a_usar:
         else:
             st.warning("Ninguna capa de agotamiento confirmada todavia")
 
-        # Velas de reversal
         if resultado["velas_rev"]:
             velas_str = " | ".join([v[1] for v in resultado["velas_rev"][-3:]])
             st.success(f"Patrones de vela: {velas_str}")
 
-        # Senales y alertas
         st.markdown("### Analisis de Rebote")
         col_r, col_a = st.columns(2)
         with col_r:
@@ -704,7 +1068,6 @@ if buscar_btn and ticker_a_usar:
             for a in resultado["alertas"]:
                 st.warning(a)
 
-        # Indicadores
         st.markdown("### Indicadores")
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("HMM Viterbi", resultado["estado_hmm"])
@@ -718,7 +1081,6 @@ if buscar_btn and ticker_a_usar:
                   f"Signal: {resultado['signal_line']}")
         c5.metric("Datos",       f"{resultado['datos']} dias")
 
-        # Backtesting
         st.markdown("### Backtesting (2 anos)")
         b1, b2, b3 = st.columns(3)
         b1.metric("Senales Compra",    resultado["compras_bt"])
@@ -727,7 +1089,6 @@ if buscar_btn and ticker_a_usar:
                     resultado["total_bt"] * 100, 1)
         b3.metric("Actividad", f"{pct}%")
 
-        # Grafica
         st.markdown("### Grafica con Niveles de Entrada y Salida")
         fig = grafica_rebote_profesional(
             resultado["df_chart"], ticker_a_usar,
@@ -736,7 +1097,7 @@ if buscar_btn and ticker_a_usar:
         if fig:
             st.plotly_chart(fig, use_container_width=True)
 
-        st.caption(f"AI.LINO Pro | HMM + Stoch RSI + Agotamiento 5 Capas | {ticker_a_usar}")
+        st.caption(f"AI.LINO Pro | HMM + Stoch RSI + Agotamiento 5 Capas + Piso Intradía | {ticker_a_usar}")
 
 st.markdown("---")
 st.markdown(
