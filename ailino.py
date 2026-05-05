@@ -1,4 +1,4 @@
-1import streamlit as st
+import streamlit as st
 import yfinance as yf
 import numpy as np
 from hmmlearn import hmm
