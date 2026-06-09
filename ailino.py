@@ -1405,7 +1405,7 @@ if busqueda and len(busqueda) >= 2 and not buscar_btn:
 
 col_r1, _ = st.columns([1, 5])
 with col_r1:
-    auto_refresh = st.checkbox("Auto-refresh 15 min")
+    auto_refresh = st.checkbox("Auto-refresh 1 min")
 if auto_refresh:
     import time; time.sleep(900); st.rerun()
 
