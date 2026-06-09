@@ -1407,7 +1407,7 @@ col_r1, _ = st.columns([1, 5])
 with col_r1:
     auto_refresh = st.checkbox("Auto-refresh 1 min")
 if auto_refresh:
-    import time; time.sleep(900); st.rerun()
+    import time; time.sleep(60); st.rerun()
 
 ticker_a_usar = st.session_state.ticker_sel or busqueda.upper().strip()
 nombre_a_usar = st.session_state.nombre_sel or busqueda
